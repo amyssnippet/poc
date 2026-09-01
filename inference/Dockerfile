@@ -14,3 +14,5 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 COPY main.py .
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+

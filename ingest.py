@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from qdrant_client import QdrantClient
@@ -7,7 +8,6 @@ from qdrant_client.models import VectorParams, Distance, PointStruct
 from tqdm import tqdm
 
 # Configuration Constants
-INVENTORY_DIR = "./poc_inventory"
 INFERENCE_API_URL = "http://localhost:8000/embed"
 QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
@@ -16,43 +16,91 @@ VECTOR_SIZE = 512
 BATCH_SIZE = 100
 MAX_WORKERS = 8
 
-def get_image_embedding(image_path: str) -> list[float]:
+def get_image_embedding(image_path: str, max_retries: int = 5) -> list[float]:
     """
-    Sends an image file to the local Inference API endpoint to obtain its CLIP vector.
+    Sends an image file to the local Inference API endpoint to obtain its CLIP vector with retry handling.
     """
-    with open(image_path, "rb") as f:
-        response = requests.post(INFERENCE_API_URL, files={"file": f})
-        response.raise_for_status()
-        return response.json()["vector"]
+    for attempt in range(max_retries):
+        try:
+            with open(image_path, "rb") as f:
+                response = requests.post(INFERENCE_API_URL, files={"file": f}, timeout=30)
+                response.raise_for_status()
+                return response.json()["vector"]
+        except (requests.exceptions.RequestException, ConnectionError) as e:
+            if attempt == max_retries - 1:
+                raise e
+            import time
+            time.sleep(1.0 * (attempt + 1))
 
-def extract_sku_id(filename: str) -> int:
-    """
-    Extracts the numeric part of the filename (e.g., 1 from 'NAT_00001.jpg') to use as Qdrant Point ID.
-    """
-    match = re.search(r"\d+", filename)
-    if match:
-        return int(match.group(0))
-    raise ValueError(f"Could not extract numeric ID from filename: {filename}")
 
-def process_file(filename: str) -> PointStruct:
+def find_all_images(base_dir: str) -> list[dict]:
     """
-    Processes a single image: fetches embedding and constructs a Qdrant PointStruct.
+    Recursively scans the target directory for image files.
+    Returns a list of dicts with file path metadata.
     """
-    image_path = os.path.join(INVENTORY_DIR, filename)
-    sku_name = os.path.splitext(filename)[0]  # e.g., "NAT_00001"
-    point_id = extract_sku_id(filename)      # e.g., 1
+    image_items = []
+    supported_exts = (".jpg", ".jpeg", ".png", ".webp")
 
-    vector = get_image_embedding(image_path)
+    for root, _, files in os.walk(base_dir):
+        for file in sorted(files):
+            if file.lower().endswith(supported_exts):
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, start=base_dir)
+                sku_name = os.path.splitext(file)[0]
+                
+                # Category is parent subfolder name if nested, otherwise root directory
+                rel_dir = os.path.dirname(rel_path)
+                category = rel_dir if rel_dir else "default"
+
+                image_items.append({
+                    "full_path": full_path,
+                    "rel_path": full_path,
+                    "filename": file,
+                    "sku": sku_name,
+                    "category": category
+                })
+
+    return sorted(image_items, key=lambda x: x["full_path"])
+
+def process_image_item(idx: int, item: dict) -> PointStruct:
+    """
+    Processes a single image item: fetches embedding and constructs a Qdrant PointStruct.
+    """
+    vector = get_image_embedding(item["full_path"])
 
     return PointStruct(
-        id=point_id,
+        id=idx,
         vector=vector,
-        payload={"sku": sku_name}
+        payload={
+            "sku": item["sku"],
+            "category": item["category"],
+            "path": item["rel_path"]
+        }
     )
 
-
 def main():
-    print("Connecting to Qdrant Vector Database...")
+    # Determine target directory from CLI argument or default locations
+    if len(sys.argv) > 1:
+        target_dir = sys.argv[1]
+    elif os.path.exists("./Jewellery_Data"):
+        target_dir = "./Jewellery_Data"
+    else:
+        target_dir = "./poc_inventory"
+
+    print(f"Target dataset directory: '{target_dir}'")
+    if not os.path.exists(target_dir):
+        raise FileNotFoundError(f"Directory '{target_dir}' does not exist.")
+
+    image_items = find_all_images(target_dir)
+    total_images = len(image_items)
+
+    if total_images == 0:
+        print(f"No image files found in '{target_dir}'. Exiting.")
+        return
+
+    print(f"Found {total_images} images across subdirectories for ingestion.")
+
+    print("\nConnecting to Qdrant Vector Database...")
     client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
     # Recreate the 'inventory' collection with 512-dim vectors and Cosine distance
@@ -75,29 +123,19 @@ def main():
                 vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
             )
 
-    # Find all image files in ./poc_inventory/
-    if not os.path.exists(INVENTORY_DIR):
-        raise FileNotFoundError(f"Directory {INVENTORY_DIR} does not exist.")
-
-    image_files = sorted([
-        f for f in os.listdir(INVENTORY_DIR)
-        if f.lower().endswith((".jpg", ".jpeg", ".png"))
-    ])
-
-    total_images = len(image_files)
-    print(f"Found {total_images} images in '{INVENTORY_DIR}' for ingestion.")
-
-    session = requests.Session()
-
     print(f"Beginning parallel ingestion into Qdrant ({MAX_WORKERS} workers, batch size {BATCH_SIZE})...")
-    with tqdm(total=total_images, desc="Ingesting Inventory", unit="img") as pbar:
+    with tqdm(total=total_images, desc="Ingesting Jewellery Data", unit="img") as pbar:
         for i in range(0, total_images, BATCH_SIZE):
-            chunk = image_files[i:i + BATCH_SIZE]
+            chunk = image_items[i:i + BATCH_SIZE]
             points_batch = []
 
             # Embed batch in parallel using ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = [executor.submit(process_file, fname) for fname in chunk]
+                # Assign 1-indexed unique integer point IDs (i + idx + 1)
+                futures = [
+                    executor.submit(process_image_item, i + idx + 1, item)
+                    for idx, item in enumerate(chunk)
+                ]
                 for future in futures:
                     points_batch.append(future.result())
                     pbar.update(1)
@@ -112,4 +150,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

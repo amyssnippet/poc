@@ -13,10 +13,18 @@ services:
 
   inference_api:
     build: ./inference
+    command: python -u main.py
+    environment:
+      - PYTHONUNBUFFERED=1
     ports:
       - "8000:8000"
+    volumes:
+      - ./inference:/app
     networks:
       - poc_network
+
+
+
     # Exposes POST http://localhost:8000/embed
 
 networks:

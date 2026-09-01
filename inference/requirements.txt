@@ -3,3 +3,6 @@ uvicorn
 python-multipart
 sentence-transformers
 Pillow
+torchvision
+rembg
+onnxruntime
