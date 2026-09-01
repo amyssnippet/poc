@@ -1,8 +1,7 @@
-version: '3.8'
-
 services:
   vector_db:
     image: qdrant/qdrant:latest
+    restart: always
     ports:
       - "6333:6333" # REST API
       - "6334:6334" # gRPC API
@@ -12,7 +11,10 @@ services:
       - poc_network
 
   inference_api:
-    build: ./inference
+    build:
+      context: ./inference
+      network: host
+    restart: always
     command: python -u main.py
     environment:
       - PYTHONUNBUFFERED=1
@@ -22,6 +24,7 @@ services:
       - ./inference:/app
     networks:
       - poc_network
+
 
 
 
