@@ -16,22 +16,35 @@ MODELS_SYNC_CONFIG = [
     {"key": "dinov2-large", "collection": "inv_dinov2_large", "dim": 1024, "label": "DINOv2 Large"},
 ]
 
+def normalize_rel_path(path: str) -> str:
+    """Normalizes any path representation to standard forward-slash relative path without leading ./"""
+    if not path:
+        return ""
+    p = os.path.normpath(path).replace("\\", "/")
+    if p.startswith("./"):
+        p = p[2:]
+    return p
+
 def scan_disk_catalog(data_dir: str = "./Jewellery_Data") -> List[Dict]:
     """Scans Jewellery_Data directory for all valid jewellery images."""
-    extensions = ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.avif", "*.JPG", "*.JPEG", "*.PNG")
+    extensions = ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.avif", "*.JPG", "*.JPEG", "*.PNG", "*.WEBP", "*.AVIF")
     files = []
     for ext in extensions:
         files.extend(glob.glob(os.path.join(data_dir, "**", ext), recursive=True))
     
     catalog = []
+    seen = set()
     for path in sorted(files):
+        norm_p = normalize_rel_path(path)
+        if norm_p in seen:
+            continue
+        seen.add(norm_p)
         abs_p = os.path.abspath(path)
-        rel_p = os.path.relpath(path, os.getcwd())
         sku = os.path.splitext(os.path.basename(path))[0]
         cat = os.path.basename(os.path.dirname(path))
         mtime = os.path.getmtime(path)
         catalog.append({
-            "path": rel_p,
+            "path": norm_p,
             "abs_path": abs_p,
             "sku": sku,
             "category": cat,
@@ -40,10 +53,10 @@ def scan_disk_catalog(data_dir: str = "./Jewellery_Data") -> List[Dict]:
     return catalog
 
 def get_indexed_paths(client: QdrantClient, collection_name: str) -> Set[str]:
-    """Retrieves all indexed image paths in a given Qdrant collection."""
-    indexed_paths = set()
+    """Retrieves all indexed image identifiers in a given Qdrant collection."""
+    indexed_keys = set()
     if not client.collection_exists(collection_name):
-        return indexed_paths
+        return indexed_keys
     
     offset = None
     while True:
@@ -51,22 +64,28 @@ def get_indexed_paths(client: QdrantClient, collection_name: str) -> Set[str]:
             records, next_offset = client.scroll(
                 collection_name=collection_name,
                 limit=1000,
-                with_payload=["path", "sku"],
+                with_payload=["path", "sku", "category"],
                 with_vectors=False,
                 offset=offset
             )
             for r in records:
-                p = (r.payload or {}).get("path")
+                payload = r.payload or {}
+                p = payload.get("path")
+                sku = payload.get("sku")
+                cat = payload.get("category")
                 if p:
-                    indexed_paths.add(p)
-                    indexed_paths.add(os.path.abspath(p))
+                    indexed_keys.add(normalize_rel_path(p))
+                    indexed_keys.add(os.path.abspath(p))
+                if sku and cat:
+                    indexed_keys.add(f"{cat}/{sku}")
+                    indexed_keys.add(sku)
             if next_offset is None:
                 break
             offset = next_offset
         except Exception as e:
             print(f"Error scrolling {collection_name}: {e}")
             break
-    return indexed_paths
+    return indexed_keys
 
 def check_catalog_sync_status(client: QdrantClient, data_dir: str = "./Jewellery_Data") -> Dict:
     """Compares files on disk against indexed vectors across all models."""
@@ -81,7 +100,11 @@ def check_catalog_sync_status(client: QdrantClient, data_dir: str = "./Jewellery
         
         unindexed = []
         for item in disk_items:
-            if item["path"] not in indexed and item["abs_path"] not in indexed:
+            # Check normalized path, absolute path, or category/sku tuple
+            p_match = item["path"] in indexed or item["abs_path"] in indexed
+            cat_sku_match = f"{item['category']}/{item['sku']}" in indexed or item["sku"] in indexed
+            
+            if not p_match and not cat_sku_match:
                 unindexed.append(item)
                 all_unindexed_items[item["path"]] = item
                 
@@ -101,6 +124,7 @@ def check_catalog_sync_status(client: QdrantClient, data_dir: str = "./Jewellery
         "has_unindexed": len(all_unindexed_items) > 0,
         "models_status": status_by_model
     }
+
 
 def generate_point_id(rel_path: str) -> int:
     """Generates a deterministic 63-bit integer Point ID from file path."""
@@ -185,3 +209,48 @@ def sync_new_items_to_qdrant(
         "errors": errors,
         "items": items_to_sync
     }
+
+if __name__ == "__main__":
+    import argparse
+    from tqdm import tqdm
+    
+    parser = argparse.ArgumentParser(description="Jewellery Vector Database Manual Sync Tool")
+    parser.add_argument("--check", action="store_true", help="Check sync status without indexing")
+    parser.add_argument("--force", action="store_true", help="Force re-sync of all catalog items")
+    parser.add_argument("--host", default="localhost", help="Qdrant host (default: localhost)")
+    parser.add_argument("--port", type=int, default=6333, help="Qdrant port (default: 6333)")
+    args = parser.parse_args()
+
+    client = QdrantClient(host=args.host, port=args.port, timeout=60)
+    print("\n==================================================")
+    print("💎 AI Jewellery Catalog Sync Manager (Terminal CLI)")
+    print("==================================================")
+    
+    status = check_catalog_sync_status(client)
+    print(f"📁 Total images in ./Jewellery_Data: {status['total_disk_items']}")
+    
+    for m_key, m_stat in status["models_status"].items():
+        print(f"  • {m_stat['label']:<16} ({m_stat['collection']}): {m_stat['total_indexed']}/{m_stat['total_disk']} indexed")
+        
+    if args.check:
+        print("\nStatus check complete.")
+        exit(0)
+        
+    items_to_sync = status["disk_items"] if args.force else status["new_items"]
+    
+    if not items_to_sync:
+        print("\n✅ All jewellery images are already 100% indexed across all 4 vector models!")
+        print("💡 Drop any new .jpg/.png files into ./Jewellery_Data/ and re-run this command to sync them.")
+    else:
+        print(f"\n⚡ Syncing {len(items_to_sync)} item(s) across all 4 models...")
+        pbar = tqdm(total=len(items_to_sync) * len(MODELS_SYNC_CONFIG), desc="Syncing")
+        def on_prog(cur, tot, msg):
+            pbar.set_description(msg[:40])
+            pbar.update(1)
+            
+        res = sync_new_items_to_qdrant(client, items_to_sync, progress_callback=on_prog)
+        pbar.close()
+        print(f"\n🎉 Successfully synced {res['synced_count']} item(s) into Qdrant collections!")
+        if res["errors"]:
+            print(f"⚠️ Errors encountered: {res['errors']}")
+

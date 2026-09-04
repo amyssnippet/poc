@@ -304,11 +304,22 @@ with tab1:
                 try:
                     from streamlit_cropper import st_cropper
                     cropped_pil = st_cropper(orig_img, realtime_update=True, box_color='#FF4B4B', aspect_ratio=None)
-                    buf = io.BytesIO()
-                    cropped_pil.save(buf, format="JPEG")
-                    effective_query_bytes = buf.getvalue()
+                    if cropped_pil is not None:
+                        buf = io.BytesIO()
+                        # Convert RGBA/palette PNG images to clean RGB on white canvas before saving as JPEG
+                        if cropped_pil.mode in ("RGBA", "LA", "P"):
+                            rgb_canvas = Image.new("RGB", cropped_pil.size, (255, 255, 255))
+                            if cropped_pil.mode == "RGBA":
+                                rgb_canvas.paste(cropped_pil, mask=cropped_pil.split()[3])
+                            else:
+                                rgb_canvas.paste(cropped_pil.convert("RGBA"))
+                            rgb_canvas.save(buf, format="JPEG", quality=95)
+                        else:
+                            cropped_pil.convert("RGB").save(buf, format="JPEG", quality=95)
+                        effective_query_bytes = buf.getvalue()
                 except Exception as e:
                     st.warning(f"Cropper tool warning: {e}")
+
 
     with col_preview:
         if query_bytes:
