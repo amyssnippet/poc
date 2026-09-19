@@ -106,7 +106,7 @@ def process_background_removal(image: Image.Image) -> Image.Image:
 @app.post("/embed")
 def embed_image(
     file: UploadFile = File(...),
-    model_name: str = Query("clip-base", description="Model variant: clip-base, clip-large, dinov2-base, dinov2-large"),
+    model_name: str = Query("dinov2-large", description="Model variant: dinov2-large (1024d)"),
     remove_bg: bool = Query(False, description="Remove background noise before feature extraction")
 ):
     contents = file.file.read()

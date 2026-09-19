@@ -6,26 +6,30 @@ import time
 import base64
 from PIL import Image
 from qdrant_client import QdrantClient
-from sync_manager import check_catalog_sync_status, sync_new_items_to_qdrant, scan_disk_catalog
+from sync_manager import (
+    check_catalog_sync_status,
+    sync_new_items_to_qdrant,
+    scan_disk_catalog,
+    DEFAULT_DATA_DIR,
+    extract_category
+)
 
 # Page configuration
 st.set_page_config(
-    page_title="AI Jewellery Visual Search & Model Benchmark",
+    page_title="DINOv2 (1024d) AI Jewellery Search Engine",
     page_icon="💎",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for Executive Dashboard Aesthetics
+# Custom CSS for Luxury Gold & Dark Glassmorphic Dashboard
 st.markdown("""
 <style>
-    /* Dark glassmorphic modern background */
     .stApp {
         background-color: #0e1117;
         color: #e0e6ed;
     }
     
-    /* Header title styling */
     .main-header {
         font-family: 'Inter', sans-serif;
         font-size: 2.3rem;
@@ -39,10 +43,21 @@ st.markdown("""
     .sub-header {
         color: #94a3b8;
         font-size: 1.05rem;
-        margin-bottom: 1.5rem;
+        margin-bottom: 1.2rem;
     }
     
-    /* Card container */
+    .model-badge-top {
+        background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%);
+        color: #ffffff;
+        padding: 5px 12px;
+        border-radius: 20px;
+        font-weight: 600;
+        font-size: 0.85rem;
+        display: inline-block;
+        margin-bottom: 1rem;
+        border: 1px solid rgba(59, 130, 246, 0.4);
+    }
+    
     .result-card {
         background: rgba(30, 41, 59, 0.7);
         border: 1px solid rgba(212, 175, 55, 0.25);
@@ -53,10 +68,9 @@ st.markdown("""
     }
     .result-card:hover {
         transform: translateY(-2px);
-        border-color: rgba(212, 175, 55, 0.7);
+        border-color: rgba(212, 175, 55, 0.8);
     }
     
-    /* Similarity badge */
     .score-badge {
         background: linear-gradient(135deg, #10b981 0%, #059669 100%);
         color: white;
@@ -73,12 +87,13 @@ st.markdown("""
         font-weight: 700;
     }
     
-    .model-badge {
+    .cat-badge {
         background: #334155;
         color: #cbd5e1;
         padding: 3px 8px;
         border-radius: 6px;
         font-size: 0.8rem;
+        text-transform: capitalize;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -87,150 +102,134 @@ st.markdown("""
 INFERENCE_API_URL = os.environ.get("INFERENCE_API_URL", "http://localhost:8000/embed")
 QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
-
-MODELS_CONFIG = {
-    "clip-base": {
-        "label": "CLIP ViT-B/32 (Semantic Baseline)",
-        "collection": "inv_clip_base",
-        "desc": "General visual semantics (category, gold tone, background)"
-    },
-    "clip-large": {
-        "label": "CLIP ViT-L/14 (High-Res CLIP)",
-        "collection": "inv_clip_large",
-        "desc": "Higher resolution semantic feature matching"
-    },
-    "dinov2-base": {
-        "label": "DINOv2 Base (Micro-Detail Specialist - 768d)",
-        "collection": "inv_dinov2_base",
-        "desc": "Dense spatial patch features & local texture geometry"
-    },
-    "dinov2-large": {
-        "label": "DINOv2 Large (Micro-Detail Specialist - 1024d)",
-        "collection": "inv_dinov2_large",
-        "desc": "Maximum spatial sensitivity for fine grid/mesh/hammered details"
-    }
-}
+MODEL_NAME = "dinov2-large"
+COLLECTION_NAME = "inv_dinov2_large"
+DATASET_PATH = "./new_data"
 
 @st.cache_resource
 def get_qdrant_client():
     return QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=60)
 
-
-def embed_image_api(image_bytes: bytes, model_name: str, remove_bg: bool) -> dict:
+def embed_image_api(image_bytes: bytes, remove_bg: bool) -> dict:
     files = {"file": ("query.jpg", image_bytes, "image/jpeg")}
-    params = {"model_name": model_name, "remove_bg": str(remove_bg).lower()}
+    params = {"model_name": MODEL_NAME, "remove_bg": str(remove_bg).lower()}
     response = requests.post(INFERENCE_API_URL, params=params, files=files, timeout=120)
     response.raise_for_status()
     return response.json()
 
-
-def search_qdrant(client: QdrantClient, collection_name: str, vector: list[float], top_k: int = 5):
+def search_qdrant(client: QdrantClient, vector: list[float], top_k: int = 6):
     try:
-        existing_cols = [c.name for c in client.get_collections().collections]
-        # If model collection is empty but default inventory exists and matches dimension (512)
-        target_col = collection_name
-        if target_col not in existing_cols and "inventory" in existing_cols and len(vector) == 512:
-            target_col = "inventory"
-
-        if target_col not in existing_cols:
+        if not client.collection_exists(COLLECTION_NAME):
             return []
 
         if hasattr(client, "query_points"):
             response = client.query_points(
-                collection_name=target_col,
+                collection_name=COLLECTION_NAME,
                 query=vector,
                 limit=top_k,
                 with_payload=True
             )
             return response.points
-        elif hasattr(client, "search"):
+        else:
             return client.search(
-                collection_name=target_col,
+                collection_name=COLLECTION_NAME,
                 query_vector=vector,
                 limit=top_k,
                 with_payload=True
             )
-        else:
-            return []
     except Exception as e:
-        st.error(f"Qdrant Search Error ({collection_name}): {e}")
+        st.error(f"Qdrant Search Error: {e}")
         return []
-
 
 # Sidebar Controls
 st.sidebar.image("https://img.icons8.com/color/96/diamond.png", width=64)
 st.sidebar.title("Search Controls")
 
-selected_model_key = st.sidebar.selectbox(
-    "Select Embedding Model",
-    options=list(MODELS_CONFIG.keys()),
-    format_func=lambda k: MODELS_CONFIG[k]["label"]
+st.sidebar.markdown(
+    """
+    <div style="background: rgba(30,41,59,0.8); padding: 10px; border-radius: 8px; border: 1px solid rgba(59,130,246,0.3); margin-bottom: 12px;">
+        <span style="font-size: 0.85rem; color: #94a3b8;">Active Vision Model</span><br/>
+        <strong style="color: #60a5fa; font-size: 1.05rem;">Meta DINOv2 Large</strong><br/>
+        <small style="color: #cbd5e1;">1024-dim • Micro-Texture Specialist</small>
+    </div>
+    """,
+    unsafe_allow_html=True
 )
 
 remove_bg_toggle = st.sidebar.checkbox(
-    "🧹 Remove Background / Noise",
-    value=True,
+    "🧹 Remove Background / Auto-Zoom",
+    value=False,
     help="Applies AI Background Isolation (rembg) to isolate the jewellery piece and filter out background reflections, skin, and cloth noise."
 )
 
-top_k_slider = st.sidebar.slider("Top Results Count", min_value=3, max_value=10, value=5)
+top_k_slider = st.sidebar.slider("Top Results Count", min_value=3, max_value=15, value=6)
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 📦 Catalog Sync Manager")
+st.sidebar.markdown("### 📦 Catalog Sync Manager (`new_data`)")
 q_client = get_qdrant_client()
 
-# Check folder vs vector DB sync status
-sync_status = check_catalog_sync_status(q_client)
+# Check dataset vs Qdrant collection status
+sync_status = check_catalog_sync_status(q_client, data_dir=DATASET_PATH)
 total_disk = sync_status["total_disk_items"]
 has_unindexed = sync_status["has_unindexed"]
 new_items_list = sync_status["new_items"]
 
 if has_unindexed:
-    st.sidebar.warning(f"🔔 **{len(new_items_list)} New Image(s) Detected!**")
-    if st.sidebar.button("⚡ Sync Catalog Now", type="primary", use_container_width=True):
-        with st.spinner("Indexing new jewellery into vector collections..."):
+    st.sidebar.warning(f"🔔 **{len(new_items_list)} Unindexed Image(s) Detected!**")
+    if st.sidebar.button("⚡ Index Dataset in Qdrant", type="primary", use_container_width=True):
+        with st.spinner("Extracting DINOv2 Large (1024d) vectors & indexing..."):
             res = sync_new_items_to_qdrant(q_client, new_items_list)
             st.sidebar.success(f"✅ Synced {res['synced_count']} items!")
             time.sleep(1)
             st.rerun()
 else:
-    st.sidebar.success(f"✅ All {total_disk} items indexed & in-sync")
+    st.sidebar.success(f"✅ All {total_disk} items indexed in Qdrant (`{COLLECTION_NAME}`)")
 
-if st.sidebar.button("🔄 Scan Folder for New Files", use_container_width=True):
+if st.sidebar.button("🔄 Rescan `new_data` Folder", use_container_width=True):
     st.rerun()
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### System Health")
 try:
     cols = [c.name for c in q_client.get_collections().collections]
-    st.sidebar.success(f"⚡ Qdrant Online ({len(cols)} Collections)")
-except Exception as e:
+    count_1024 = q_client.count(COLLECTION_NAME).count if COLLECTION_NAME in cols else 0
+    st.sidebar.success(f"⚡ Qdrant Online ({count_1024} vectors in 1024d collection)")
+except Exception:
     st.sidebar.error("❌ Qdrant Database Offline")
 
 try:
-    r_health = requests.get("http://localhost:8000/docs", timeout=2)
+    r_health = requests.get(f"{os.path.dirname(INFERENCE_API_URL)}/health", timeout=2)
     if r_health.status_code == 200:
-        st.sidebar.success("⚡ Inference API Online")
+        st.sidebar.success("⚡ Inference API Online (DINOv2 1024d)")
+    else:
+        st.sidebar.warning("⚠️ Inference API Starting...")
 except Exception:
     st.sidebar.error("❌ Inference API Offline")
 
 # Header Section
 st.markdown('<div class="main-header">💎 AI Jewellery Visual Search Engine</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Fine Micro-Detail & Texture Pattern Matcher (Grid Mesh vs. Hammered vs. Filigree)</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="model-badge-top">🧬 Model: Meta DINOv2 Large (1024-dimensional Patch Embeddings)</div>',
+    unsafe_allow_html=True
+)
+st.markdown(
+    '<div class="sub-header">Trained on <code>new_data</code> catalog for fine geometric micro-texture & pattern matching (Grid Mesh • Filigree • Pave Diamonds • Hammered Gold)</div>',
+    unsafe_allow_html=True
+)
 
-# Notification Banner for New Unindexed Images
+# Unindexed Warning Banner
 if has_unindexed:
-    st.warning(f"🔔 **Catalog Update**: {len(new_items_list)} new jewellery image(s) detected in `./Jewellery_Data/`!")
-    with st.expander(f"👁️ View {len(new_items_list)} Unindexed Images & Quick Sync", expanded=True):
+    st.warning(f"🔔 **Unindexed Images**: Found {len(new_items_list)} unindexed jewellery image(s) in `{DATASET_PATH}`. Index them to make them searchable!")
+    with st.expander(f"👁️ View Unindexed Images & Run Batch Indexing", expanded=False):
         preview_count = min(len(new_items_list), 6)
         sync_cols = st.columns(preview_count)
         for idx, item in enumerate(new_items_list[:preview_count]):
             with sync_cols[idx]:
                 if os.path.exists(item["path"]):
                     st.image(item["path"], use_container_width=True)
-                st.caption(f"**{item['sku']}**\n\nCategory: `{item['category']}`")
+                st.caption(f"**{item['sku']}**\n\n`{item['category']}`")
                 
-        if st.button("⚡ Index & Sync All New Images Across 4 Models", type="primary", use_container_width=True):
+        if st.button("🚀 Index All Unindexed Items Now", type="primary", use_container_width=True):
             pbar = st.progress(0.0)
             status_placeholder = st.empty()
             
@@ -239,34 +238,36 @@ if has_unindexed:
                 status_placeholder.text(f"[{cur}/{tot}] {desc}")
                 
             res = sync_new_items_to_qdrant(q_client, new_items_list, progress_callback=handle_prog)
-            st.success(f"🎉 Successfully indexed {res['synced_count']} new items across all 4 vector models!")
+            st.success(f"🎉 Successfully indexed {res['synced_count']} items with DINOv2 Large!")
             time.sleep(1.5)
             st.rerun()
 
 tab1, tab2, tab3 = st.tabs([
-    "🔍 Single Model Search",
-    "📊 Multi-Model Side-by-Side Benchmark",
-    "➕ Add & Sync New Jewellery"
+    "🔍 Visual Similarity Search",
+    "🔬 Micro-Texture & Detail Inspector",
+    "➕ Add & Index New Jewellery"
 ])
 
 with tab1:
     col_upload, col_preview = st.columns([1, 1])
     
     with col_upload:
-        st.markdown("### 1. Provide Query Image")
-        uploaded_file = st.file_uploader("Upload Ring or Necklace Image", type=["jpg", "jpeg", "png", "webp", "avif"])
-
-        
-        sample_choice = st.selectbox(
-            "Or choose from test gallery:",
-            [
-                "(None)",
-                "Model Wearing Gold Ring (test/images.jpeg)",
-                "Grid Mesh Ring (test/shopping.jpeg)",
-                "Gold Platinum Ring (test/gold-platinum-ring.avif)",
-                "Sample Ring 081 (Jewellery_Data/ring/ring_081.jpg)"
-            ]
+        st.markdown("### 1. Query Image")
+        uploaded_file = st.file_uploader(
+            "Upload Ring, Bangle, Earring, or Necklace Image",
+            type=["jpg", "jpeg", "png", "webp", "avif"]
         )
+
+        sample_options = [
+            "(None)",
+            "Grid Mesh Ring (test/shopping.jpeg)",
+            "Gold Platinum Ring (test/gold-platinum-ring.avif)",
+            "Model Wearing Ring (test/images.jpeg)",
+            "Diamond Ring Sample (new_data/image/CRN00143.jpg)",
+            "Diamond Bangle Sample (new_data/image/DBG00015.jpg)",
+            "Diamond Earring Sample (new_data/image/DER00268.jpg)"
+        ]
+        sample_choice = st.selectbox("Or select from test gallery:", sample_options)
 
     # Determine query image bytes
     query_bytes = None
@@ -276,14 +277,20 @@ with tab1:
         query_bytes = uploaded_file.getvalue()
         query_name = uploaded_file.name
     elif sample_choice != "(None)":
-        if "images.jpeg" in sample_choice:
-            img_path = "./test/images.jpeg"
-        elif "shopping.jpeg" in sample_choice:
+        if "shopping.jpeg" in sample_choice:
             img_path = "./test/shopping.jpeg"
         elif "gold-platinum" in sample_choice:
             img_path = "./test/gold-platinum-ring-377062544-zkx5j.jpg.avif"
+        elif "images.jpeg" in sample_choice:
+            img_path = "./test/images.jpeg"
+        elif "CRN00143" in sample_choice:
+            img_path = "./new_data/image/CRN00143.jpg"
+        elif "DBG00015" in sample_choice:
+            img_path = "./new_data/image/DBG00015.jpg"
+        elif "DER00268" in sample_choice:
+            img_path = "./new_data/image/DER00268.jpg"
         else:
-            img_path = "./Jewellery_Data/ring/ring_081.jpg"
+            img_path = "./test/shopping.jpeg"
         
         if os.path.exists(img_path):
             with open(img_path, "rb") as f:
@@ -306,7 +313,6 @@ with tab1:
                     cropped_pil = st_cropper(orig_img, realtime_update=True, box_color='#FF4B4B', aspect_ratio=None)
                     if cropped_pil is not None:
                         buf = io.BytesIO()
-                        # Convert RGBA/palette PNG images to clean RGB on white canvas before saving as JPEG
                         if cropped_pil.mode in ("RGBA", "LA", "P"):
                             rgb_canvas = Image.new("RGB", cropped_pil.size, (255, 255, 255))
                             if cropped_pil.mode == "RGBA":
@@ -320,24 +326,22 @@ with tab1:
                 except Exception as e:
                     st.warning(f"Cropper tool warning: {e}")
 
-
     with col_preview:
         if query_bytes:
-            st.markdown("### 2. Input Image Previews")
+            st.markdown("### 2. Previews")
             p_col1, p_col2 = st.columns(2)
             show_input = Image.open(io.BytesIO(effective_query_bytes))
-            p_col1.image(show_input, caption="Target Query Image (Focused)", use_container_width=True)
+            p_col1.image(show_input, caption="Target Query Image", use_container_width=True)
             
             if remove_bg_toggle:
-                st.info("AI Background Noise Removal & Auto-Zoom Enabled (Isolating Jewellery...)")
+                st.info("🧹 Background Removal & Auto-Centering Enabled")
             else:
-                st.warning("Background Noise Removal Disabled")
+                st.warning("Raw Image (Background Removal Disabled)")
 
-    if effective_query_bytes and st.button("🚀 Run Visual Similarity Search", type="primary", use_container_width=True):
-        model_info = MODELS_CONFIG[selected_model_key]
-        with st.spinner(f"Extracting vectors using {model_info['label']}..."):
+    if effective_query_bytes and st.button("🚀 Run DINOv2 Visual Search", type="primary", use_container_width=True):
+        with st.spinner("Extracting 1024-dim DINOv2 Large feature embedding..."):
             try:
-                res_embed = embed_image_api(effective_query_bytes, selected_model_key, remove_bg_toggle)
+                res_embed = embed_image_api(effective_query_bytes, remove_bg_toggle)
                 vec = res_embed["vector"]
                 
                 # Show processed background-removed image if available
@@ -345,18 +349,16 @@ with tab1:
                     proc_b64 = res_embed["processed_image_b64"]
                     proc_bytes = base64.b64decode(proc_b64)
                     with col_preview:
-                        p_col2.image(Image.open(io.BytesIO(proc_bytes)), caption="AI Cleaned & Zoomed (Background Removed)", use_container_width=True)
+                        p_col2.image(Image.open(io.BytesIO(proc_bytes)), caption="AI Cleaned & Centered", use_container_width=True)
 
-
-                # Query Qdrant
-                hits = search_qdrant(q_client, model_info["collection"], vec, top_k=top_k_slider)
+                hits = search_qdrant(q_client, vec, top_k=top_k_slider)
                 
                 st.markdown("---")
                 if len(hits) == 0:
-                    st.warning(f"No items found in collection '{model_info['collection']}'. You can index the dataset for this model by clicking 'Index Dataset' in the sidebar or running benchmark.py.")
+                    st.warning(f"No items found in collection '{COLLECTION_NAME}'. Click 'Index Dataset in Qdrant' in the sidebar or run ingest.py.")
                 else:
-                    st.markdown(f"### Top {len(hits)} Similar Items Retrieved (`{model_info['collection']}`)")
-                    num_cols = min(len(hits), 5)
+                    st.markdown(f"### Top {len(hits)} Matching Items Retrieved (DINOv2 1024d)")
+                    num_cols = min(len(hits), 6)
                     res_cols = st.columns(num_cols)
                     for idx, hit in enumerate(hits):
                         col = res_cols[idx % num_cols]
@@ -368,64 +370,71 @@ with tab1:
                         score_pct = score * 100
                         
                         with col:
-                            st.markdown(f'<div class="result-card">', unsafe_allow_html=True)
+                            st.markdown('<div class="result-card">', unsafe_allow_html=True)
                             if rel_path and os.path.exists(rel_path):
                                 st.image(rel_path, use_container_width=True)
                             else:
                                 st.write("📷 [Image Preview]")
                             
                             st.markdown(f"**{sku}**")
-                            st.markdown(f"<span class='model-badge'>{cat}</span>", unsafe_allow_html=True)
+                            st.markdown(f"<span class='cat-badge'>{cat}</span>", unsafe_allow_html=True)
                             st.markdown(f"<div style='margin-top: 6px;'><span class='score-badge score-badge-high'>{score_pct:.2f}% Match</span></div>", unsafe_allow_html=True)
-                            st.markdown(f"</div>", unsafe_allow_html=True)
-
+                            st.markdown('</div>', unsafe_allow_html=True)
 
             except Exception as e:
                 st.error(f"Execution Error: {e}")
 
 with tab2:
-    st.markdown("### 📊 Side-by-Side Model Benchmark Comparison")
-    st.markdown("Compare semantic focus (CLIP) vs. fine micro-texture focus (DINOv2) on the exact same query image.")
+    st.markdown("### 🔬 Micro-Texture & Detail Inspector")
+    st.markdown("Inspect fine geometric patterns (grid mesh, pave diamond layout, prong settings) comparing query against top match.")
     
-    if effective_query_bytes and st.button("⚡ Compare All 4 Models Simultaneously", type="secondary", use_container_width=True):
-        cols = st.columns(4)
-        for idx, (m_key, m_cfg) in enumerate(MODELS_CONFIG.items()):
-            with cols[idx]:
-                st.markdown(f"#### {m_cfg['label'].split(' ')[0]} {m_cfg['label'].split(' ')[1]}")
-                st.caption(m_cfg["desc"])
+    if effective_query_bytes:
+        if st.button("🔎 Inspect Query vs. Top Match", type="secondary", use_container_width=True):
+            try:
+                res_embed = embed_image_api(effective_query_bytes, remove_bg_toggle)
+                vec = res_embed["vector"]
+                hits = search_qdrant(q_client, vec, top_k=1)
                 
-                try:
-                    res = embed_image_api(effective_query_bytes, m_key, remove_bg_toggle)
-                    v = res["vector"]
-                    hits = search_qdrant(q_client, m_cfg["collection"], v, top_k=5)
-
+                if hits:
+                    top_hit = hits[0]
+                    p = top_hit.payload or {}
+                    top_path = p.get("path", "")
+                    top_sku = p.get("sku", "")
+                    top_score = top_hit.score
                     
-                    for rank, h in enumerate(hits, 1):
-                        p = h.payload or {}
-                        sku = p.get("sku", f"ID_{h.id}")
-                        path = p.get("path", "")
-                        score = h.score
-                        
-                        st.markdown(f"**#{rank} {sku}** ({score*100:.1f}%)")
-                        if path and os.path.exists(path):
-                            st.image(path, use_container_width=True)
-                        st.markdown("---")
-                except Exception as e:
-                    st.error(f"Error querying {m_key}: {e}")
+                    insp_col1, insp_col2 = st.columns(2)
+                    with insp_col1:
+                        st.markdown("#### Query Image (Target)")
+                        st.image(Image.open(io.BytesIO(effective_query_bytes)), use_container_width=True)
+                    with insp_col2:
+                        st.markdown(f"#### Top Retrieved Match: **{top_sku}** ({top_score*100:.2f}%)")
+                        if top_path and os.path.exists(top_path):
+                            st.image(top_path, use_container_width=True)
+                        st.info(f"DINOv2 Large matched spatial patch tokens with Cosine similarity score of `{top_score:.4f}`.")
+                else:
+                    st.warning("No matches in collection. Please index dataset first.")
+            except Exception as e:
+                st.error(f"Error inspecting: {e}")
+    else:
+        st.info("Select or upload a query image in Tab 1 to run the Micro-Texture Inspector.")
 
 with tab3:
-    st.markdown("### ➕ Add New Jewellery to Catalog (Instant Vector Sync)")
-    st.markdown("Upload new products directly to the catalog. Vectors will be generated and auto-synced across all 4 AI models instantly.")
+    st.markdown("### ➕ Add New Jewellery to Catalog (`new_data`)")
+    st.markdown("Upload new products directly to `new_data`. Vectors will be extracted using DINOv2 Large (1024d) and indexed instantly.")
     
     add_col1, add_col2 = st.columns([1, 1])
     with add_col1:
-        new_file = st.file_uploader("Upload Product Image", type=["jpg", "jpeg", "png", "webp", "avif"], key="tab3_new_file")
-        category_options = ["ring", "necklace", "earring", "bracelet", "pendant", "custom"]
+        new_file = st.file_uploader(
+            "Upload Product Image",
+            type=["jpg", "jpeg", "png", "webp", "avif"],
+            key="tab3_new_file"
+        )
+        category_options = ["ring", "necklace", "earring", "bangle", "bracelet", "pendant", "tanmaniya", "custom"]
         chosen_cat = st.selectbox("Product Category", category_options)
         if chosen_cat == "custom":
             chosen_cat = st.text_input("Enter Custom Category Name", value="jewellery").strip()
             
-        custom_sku = st.text_input("Product SKU / Code", placeholder="e.g. ring_501 or diamond_band_01").strip()
+        custom_sku = st.text_input("Product SKU / Code", placeholder="e.g. DRN00999 or mesh_ring_01").strip()
         
     with add_col2:
         if new_file:
@@ -436,12 +445,10 @@ with tab3:
                 default_name = os.path.splitext(new_file.name)[0]
                 custom_sku = default_name
                 
-            if st.button("💾 Save to Catalog & Auto-Index All 4 Models", type="primary", use_container_width=True):
-                # 1. Ensure target directory exists
-                dest_dir = os.path.join("./Jewellery_Data", chosen_cat)
+            if st.button("💾 Save & Index with DINOv2 Large (1024d)", type="primary", use_container_width=True):
+                dest_dir = os.path.join(DATASET_PATH, "image")
                 os.makedirs(dest_dir, exist_ok=True)
                 
-                # 2. Save file
                 file_ext = os.path.splitext(new_file.name)[1] or ".jpg"
                 dest_filename = f"{custom_sku}{file_ext}"
                 dest_path = os.path.join(dest_dir, dest_filename)
@@ -449,9 +456,8 @@ with tab3:
                 with open(dest_path, "wb") as f:
                     f.write(new_file.getvalue())
                     
-                st.info(f"📁 Saved file to `{dest_path}`. Extracting vectors for 4 AI models...")
+                st.info(f"📁 Saved file to `{dest_path}`. Generating 1024-dim DINOv2 Large vector...")
                 
-                # 3. Trigger auto-sync
                 item_info = {
                     "path": os.path.relpath(dest_path, os.getcwd()),
                     "abs_path": os.path.abspath(dest_path),
@@ -460,17 +466,10 @@ with tab3:
                     "mtime": time.time()
                 }
                 
-                prog = st.progress(0.0)
-                status_box = st.empty()
-                def on_add_prog(c, t, msg):
-                    prog.progress(c / t)
-                    status_box.text(f"[{c}/{t}] {msg}")
-                    
-                sync_res = sync_new_items_to_qdrant(q_client, [item_info], progress_callback=on_add_prog)
+                sync_res = sync_new_items_to_qdrant(q_client, [item_info])
                 if not sync_res["errors"]:
-                    st.success(f"🎉 **{custom_sku}** successfully added to catalog and indexed across all 4 vector models!")
-                    time.sleep(2)
+                    st.success(f"🎉 **{custom_sku}** successfully added and indexed with DINOv2 Large (1024d)!")
+                    time.sleep(1.5)
                     st.rerun()
                 else:
-                    st.error(f"Sync encountered errors: {sync_res['errors']}")
-
+                    st.error(f"Sync error: {sync_res['errors']}")

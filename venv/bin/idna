@@ -1,4 +1,4 @@
-#!/Users/amol/Developer/poc/venv/bin/python3.14
+#!/home/amolycd/Dev/poc/venv/bin/python3
 import sys
 from idna.cli import main
 if __name__ == '__main__':

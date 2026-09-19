@@ -9,8 +9,8 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the CLIP model into the image during the build phase
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('clip-ViT-B-32')"
+# Pre-download the DINOv2-Large model into the image during the build phase
+RUN python -c "from transformers import AutoImageProcessor, AutoModel; AutoImageProcessor.from_pretrained('facebook/dinov2-large'); AutoModel.from_pretrained('facebook/dinov2-large')"
 
 COPY main.py .
 

@@ -5,16 +5,21 @@ import hashlib
 import requests
 from typing import Dict, List, Set, Optional, Callable
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct
+from qdrant_client.models import VectorParams, Distance, PointStruct
 
-INFERENCE_API_URL = "http://localhost:8000/embed"
+INFERENCE_API_URL = os.environ.get("INFERENCE_API_URL", "http://localhost:8000/embed")
 
+# Target DINOv2 Large (1024 dimensions)
 MODELS_SYNC_CONFIG = [
-    {"key": "clip-base", "collection": "inv_clip_base", "dim": 512, "label": "CLIP ViT-B/32"},
-    {"key": "dinov2-base", "collection": "inv_dinov2_base", "dim": 768, "label": "DINOv2 Base"},
-    {"key": "clip-large", "collection": "inv_clip_large", "dim": 768, "label": "CLIP ViT-L/14"},
-    {"key": "dinov2-large", "collection": "inv_dinov2_large", "dim": 1024, "label": "DINOv2 Large"},
+    {
+        "key": "dinov2-large",
+        "collection": "inv_dinov2_large",
+        "dim": 1024,
+        "label": "Meta DINOv2 Large (1024d)"
+    }
 ]
+
+DEFAULT_DATA_DIR = "./new_data"
 
 def normalize_rel_path(path: str) -> str:
     """Normalizes any path representation to standard forward-slash relative path without leading ./"""
@@ -25,8 +30,32 @@ def normalize_rel_path(path: str) -> str:
         p = p[2:]
     return p
 
-def scan_disk_catalog(data_dir: str = "./Jewellery_Data") -> List[Dict]:
-    """Scans Jewellery_Data directory for all valid jewellery images."""
+def extract_category(path: str, sku: str) -> str:
+    """Extracts jewellery category from folder structure or SKU prefix."""
+    parent = os.path.basename(os.path.dirname(path))
+    if parent.lower() not in ("image", "images", "new_data", "data", ".", ""):
+        return parent.lower()
+    
+    # Auto-classify based on SKU prefix from new_data
+    s = sku.upper()
+    if any(s.startswith(p) for p in ["CRN", "DRN", "DFR", "DHR", "MRN", "R00", "MPR"]):
+        return "ring"
+    elif any(s.startswith(p) for p in ["CNK", "DNK", "DFN", "NFD"]):
+        return "necklace"
+    elif any(s.startswith(p) for p in ["CER", "DER", "DFE", "DHE"]):
+        return "earring"
+    elif any(s.startswith(p) for p in ["CBG", "DBG", "MBG", "DFB"]):
+        return "bangle"
+    elif any(s.startswith(p) for p in ["DBR", "MBR"]):
+        return "bracelet"
+    elif any(s.startswith(p) for p in ["CPE", "DPE"]):
+        return "pendant"
+    elif any(s.startswith(p) for p in ["CTN", "DTN"]):
+        return "tanmaniya"
+    return "jewellery"
+
+def scan_disk_catalog(data_dir: str = DEFAULT_DATA_DIR) -> List[Dict]:
+    """Scans dataset directory for all valid jewellery images."""
     extensions = ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.avif", "*.JPG", "*.JPEG", "*.PNG", "*.WEBP", "*.AVIF")
     files = []
     for ext in extensions:
@@ -35,13 +64,16 @@ def scan_disk_catalog(data_dir: str = "./Jewellery_Data") -> List[Dict]:
     catalog = []
     seen = set()
     for path in sorted(files):
+        # Ignore temporary or metadata files
+        if "Thumbs.db" in path or os.path.basename(path).startswith("."):
+            continue
         norm_p = normalize_rel_path(path)
         if norm_p in seen:
             continue
         seen.add(norm_p)
         abs_p = os.path.abspath(path)
         sku = os.path.splitext(os.path.basename(path))[0]
-        cat = os.path.basename(os.path.dirname(path))
+        cat = extract_category(path, sku)
         mtime = os.path.getmtime(path)
         catalog.append({
             "path": norm_p,
@@ -87,8 +119,8 @@ def get_indexed_paths(client: QdrantClient, collection_name: str) -> Set[str]:
             break
     return indexed_keys
 
-def check_catalog_sync_status(client: QdrantClient, data_dir: str = "./Jewellery_Data") -> Dict:
-    """Compares files on disk against indexed vectors across all models."""
+def check_catalog_sync_status(client: QdrantClient, data_dir: str = DEFAULT_DATA_DIR) -> Dict:
+    """Compares files on disk against indexed vectors in Qdrant for DINOv2 Large."""
     disk_items = scan_disk_catalog(data_dir)
     
     status_by_model = {}
@@ -96,11 +128,17 @@ def check_catalog_sync_status(client: QdrantClient, data_dir: str = "./Jewellery
     
     for m in MODELS_SYNC_CONFIG:
         col = m["collection"]
+        # Ensure collection exists
+        if not client.collection_exists(col):
+            client.create_collection(
+                collection_name=col,
+                vectors_config=VectorParams(size=m["dim"], distance=Distance.COSINE)
+            )
+            
         indexed = get_indexed_paths(client, col)
         
         unindexed = []
         for item in disk_items:
-            # Check normalized path, absolute path, or category/sku tuple
             p_match = item["path"] in indexed or item["abs_path"] in indexed
             cat_sku_match = f"{item['category']}/{item['sku']}" in indexed or item["sku"] in indexed
             
@@ -125,13 +163,12 @@ def check_catalog_sync_status(client: QdrantClient, data_dir: str = "./Jewellery
         "models_status": status_by_model
     }
 
-
 def generate_point_id(rel_path: str) -> int:
     """Generates a deterministic 63-bit integer Point ID from file path."""
     return int(hashlib.sha256(rel_path.encode("utf-8")).hexdigest()[:14], 16)
 
-def fetch_embedding(img_path: str, model_name: str, remove_bg: bool = False, max_retries: int = 3) -> Optional[List[float]]:
-    """Calls Inference API to extract embedding vector."""
+def fetch_embedding(img_path: str, model_name: str = "dinov2-large", remove_bg: bool = False, max_retries: int = 3) -> Optional[List[float]]:
+    """Calls Inference API to extract DINOv2 Large 1024-dim embedding vector."""
     for attempt in range(max_retries):
         try:
             with open(img_path, "rb") as f:
@@ -139,7 +176,7 @@ def fetch_embedding(img_path: str, model_name: str, remove_bg: bool = False, max
                     INFERENCE_API_URL,
                     params={"model_name": model_name, "remove_bg": str(remove_bg).lower()},
                     files={"file": f},
-                    timeout=60
+                    timeout=120
                 )
                 r.raise_for_status()
                 return r.json()["vector"]
@@ -147,7 +184,7 @@ def fetch_embedding(img_path: str, model_name: str, remove_bg: bool = False, max
             if attempt == max_retries - 1:
                 print(f"Failed embedding {img_path} with {model_name}: {e}")
                 return None
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(2.0 * (attempt + 1))
     return None
 
 def sync_new_items_to_qdrant(
@@ -157,7 +194,7 @@ def sync_new_items_to_qdrant(
     progress_callback: Optional[Callable[[int, int, str], None]] = None
 ) -> Dict:
     """
-    Incrementally indexes new items across models into Qdrant.
+    Incrementally indexes items into Qdrant using DINOv2 Large (1024d).
     """
     if models is None:
         models = MODELS_SYNC_CONFIG
@@ -169,6 +206,14 @@ def sync_new_items_to_qdrant(
     for m in models:
         m_key = m["key"]
         col = m["collection"]
+        
+        # Ensure collection exists with 1024 dimensions
+        if not client.collection_exists(col):
+            client.create_collection(
+                collection_name=col,
+                vectors_config=VectorParams(size=m["dim"], distance=Distance.COSINE)
+            )
+            
         points_to_upsert = []
         
         for item in items_to_sync:
@@ -178,7 +223,7 @@ def sync_new_items_to_qdrant(
             cat = item["category"]
             
             if progress_callback:
-                progress_callback(current_step, total_steps, f"Indexing {sku} ({m['label']})...")
+                progress_callback(current_step, total_steps, f"Embedding {sku} with {m['label']}...")
                 
             try:
                 vec = fetch_embedding(path, m_key)
@@ -191,17 +236,20 @@ def sync_new_items_to_qdrant(
                             "sku": sku,
                             "category": cat,
                             "path": path,
-                            "synced_at": time.time()
+                            "synced_at": time.time(),
+                            "model": m_key
                         }
                     ))
+                    
+                # Upsert in chunks of 25 to avoid large request payloads
+                if len(points_to_upsert) >= 25:
+                    client.upsert(collection_name=col, points=points_to_upsert)
+                    points_to_upsert = []
             except Exception as e:
                 errors.append(f"{sku} ({m_key}): {str(e)}")
                 
         if points_to_upsert:
-            client.upsert(
-                collection_name=col,
-                points=points_to_upsert
-            )
+            client.upsert(collection_name=col, points=points_to_upsert)
             
     return {
         "synced_count": len(items_to_sync),
@@ -214,7 +262,8 @@ if __name__ == "__main__":
     import argparse
     from tqdm import tqdm
     
-    parser = argparse.ArgumentParser(description="Jewellery Vector Database Manual Sync Tool")
+    parser = argparse.ArgumentParser(description="DINOv2 Large (1024d) Jewellery Catalog Vector Sync Tool")
+    parser.add_argument("--data_dir", default=DEFAULT_DATA_DIR, help=f"Directory to scan (default: {DEFAULT_DATA_DIR})")
     parser.add_argument("--check", action="store_true", help="Check sync status without indexing")
     parser.add_argument("--force", action="store_true", help="Force re-sync of all catalog items")
     parser.add_argument("--host", default="localhost", help="Qdrant host (default: localhost)")
@@ -222,15 +271,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     client = QdrantClient(host=args.host, port=args.port, timeout=60)
-    print("\n==================================================")
-    print("💎 AI Jewellery Catalog Sync Manager (Terminal CLI)")
-    print("==================================================")
+    print("\n==================================================================")
+    print("💎 DINOv2 Large (1024d) Jewellery Catalog Sync Manager")
+    print("==================================================================")
     
-    status = check_catalog_sync_status(client)
-    print(f"📁 Total images in ./Jewellery_Data: {status['total_disk_items']}")
+    status = check_catalog_sync_status(client, data_dir=args.data_dir)
+    print(f"📁 Target dataset: {args.data_dir}")
+    print(f"📁 Total images detected on disk: {status['total_disk_items']}")
     
     for m_key, m_stat in status["models_status"].items():
-        print(f"  • {m_stat['label']:<16} ({m_stat['collection']}): {m_stat['total_indexed']}/{m_stat['total_disk']} indexed")
+        print(f"  • {m_stat['label']} ({m_stat['collection']}): {m_stat['total_indexed']}/{m_stat['total_disk']} indexed")
         
     if args.check:
         print("\nStatus check complete.")
@@ -239,18 +289,17 @@ if __name__ == "__main__":
     items_to_sync = status["disk_items"] if args.force else status["new_items"]
     
     if not items_to_sync:
-        print("\n✅ All jewellery images are already 100% indexed across all 4 vector models!")
-        print("💡 Drop any new .jpg/.png files into ./Jewellery_Data/ and re-run this command to sync them.")
+        print("\n✅ All jewellery images are already 100% indexed in Qdrant with DINOv2 Large (1024d)!")
+        print("💡 Drop any new .jpg/.png files into new_data/ and re-run this command to sync them.")
     else:
-        print(f"\n⚡ Syncing {len(items_to_sync)} item(s) across all 4 models...")
-        pbar = tqdm(total=len(items_to_sync) * len(MODELS_SYNC_CONFIG), desc="Syncing")
+        print(f"\n⚡ Syncing {len(items_to_sync)} item(s) using DINOv2 Large (1024d)...")
+        pbar = tqdm(total=len(items_to_sync), desc="DINOv2 Embedding")
         def on_prog(cur, tot, msg):
-            pbar.set_description(msg[:40])
+            pbar.set_description(msg[:45])
             pbar.update(1)
             
         res = sync_new_items_to_qdrant(client, items_to_sync, progress_callback=on_prog)
         pbar.close()
-        print(f"\n🎉 Successfully synced {res['synced_count']} item(s) into Qdrant collections!")
+        print(f"\n🎉 Successfully synced {res['synced_count']} item(s) into Qdrant collection 'inv_dinov2_large'!")
         if res["errors"]:
             print(f"⚠️ Errors encountered: {res['errors']}")
-
